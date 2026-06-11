@@ -1,148 +1,71 @@
-"""
-slab_loader.py
---------------
-Downloads and loads Slab2 depth grids for the 13 subduction zones
-used in Chau, Bendick, Choi, Mahadevan (2026), arXiv:2606.02520.
-
-The published Slab2 v2 grids (Hayes et al. 2018, Science) are served
-directly from the usgs/slab2 GitHub repository (0418database branch).
-Each file is a GMT/NetCDF grid with columns: lon, lat, depth (km, negative down).
-
-Zone codes follow the Slab2 convention:
-    alu  Aleutians          cam  Central America
-    cas  Cascadia           izu  Izu-Bonin
-    ker  Kermadec           kur  Kuril
-    phi  Philippines        ryu  Ryukyu
-    sam  South America      sco  Scotia
-    sol  Solomon Islands    sum  Sumatra/Java
-    van  Vanuatu
-"""
-
-import os
-import requests
-import numpy as np
+import os, tarfile, requests, numpy as np
 from pathlib import Path
 
-# ── constants ──────────────────────────────────────────────────────────────────
+ZONES = ["alu","cam","cas","izu","ker","kur","phi","ryu","sam","sco","sol","sum","van"]
 
-ZONES = ["alu", "cam", "cas", "izu", "ker", "kur",
-         "phi", "ryu", "sam", "sco", "sol", "sum", "van"]
+_SCIENCEBASE_URL = ("https://www.sciencebase.gov/catalog/file/get/"
+    "5aa1b00ee4b0b1c392e86467"
+    "?f=__disk__d5%2F91%2F39%2Fd591399bf4f249ab49ffec8a366e5070fe96e0ba")
+_TAR_FILENAME = "Slab2Distribute_Mar2018.tar.gz"
 
-# Hayes et al. 2018 (April release) — the version used in Chau et al. 2026
-_SLAB2_RELEASE_TAG = "02.24.18"
+def _tar_path(d): return Path(d) / _TAR_FILENAME
 
-# Direct raw download base from usgs/slab2 GitHub (0418database folder).
-# Each depth grid: [zone]_slab2_dep_02.24.18.csv  (lon, lat, dep columns)
-_GITHUB_BASE = (
-    "https://raw.githubusercontent.com/usgs/slab2/master/0418database"
-)
+def download_slab2_archive(data_dir="data/slab2", force=False):
+    d = Path(data_dir); d.mkdir(parents=True, exist_ok=True)
+    dest = _tar_path(d)
+    if dest.exists() and not force: return dest
+    print("Downloading Slab2 archive (~134 MB) …", flush=True)
+    r = requests.get(_SCIENCEBASE_URL, stream=True, timeout=300)
+    r.raise_for_status()
+    n = 0
+    with open(dest,"wb") as f:
+        for chunk in r.iter_content(65536):
+            f.write(chunk); n += len(chunk)
+            print(f"\r  {n/1048576:.1f} MB", end="", flush=True)
+    print(f"\n  Saved to {dest}"); return dest
 
-# ── helpers ────────────────────────────────────────────────────────────────────
+def extract_depth_grids(data_dir="data/slab2", force=False):
+    d = Path(data_dir); tar = _tar_path(d)
+    if not tar.exists(): raise FileNotFoundError(f"Not found: {tar}")
+    found = {}
+    print("Extracting depth grids …")
+    with tarfile.open(tar,"r:gz") as tf:
+        for m in tf.getmembers():
+            fname = os.path.basename(m.name)
+            if "_slab2_dep_" in fname and fname.endswith(".grd"):
+                zone = fname.split("_slab2_")[0]
+                if zone not in ZONES: continue
+                dest = d / fname
+                if dest.exists() and not force: found[zone]=dest; continue
+                fobj = tf.extractfile(m)
+                if fobj: dest.write_bytes(fobj.read()); found[zone]=dest; print(f"  {zone}")
+    print(f"Done. {len(found)}/{len(ZONES)} zones."); return found
 
-def _local_cache(data_dir: Path, zone: str) -> Path:
-    return data_dir / f"{zone}_slab2_dep_{_SLAB2_RELEASE_TAG}.csv"
+def download_all_zones(data_dir="data/slab2", force=False):
+    download_slab2_archive(data_dir, force=force)
+    return extract_depth_grids(data_dir, force=force)
 
+def load_zone_grid(path):
+    import netCDF4, numpy as np
+    with netCDF4.Dataset(str(path),"r") as ds:
+        xk = next((k for k in ("x","lon","longitude") if k in ds.variables),None)
+        yk = next((k for k in ("y","lat","latitude")  if k in ds.variables),None)
+        zk = next((k for k in ("z","dep","depth")     if k in ds.variables),None)
+        if not all([xk,yk,zk]):
+            raise ValueError(f"Unknown vars in {path}: {list(ds.variables)}")
+        lons  = np.array(ds.variables[xk][:], dtype=np.float64)
+        lats  = np.array(ds.variables[yk][:], dtype=np.float64)
+        dep2d = np.ma.filled(ds.variables[zk][:], np.nan).astype(np.float64)
+    dep2d = np.where(np.abs(dep2d)>1e6, np.nan, -dep2d)
+    if dep2d.ndim==3: dep2d=dep2d[0]
+    lon2d,lat2d = np.meshgrid(lons,lats)
+    spacing = float(lons[1]-lons[0]) if len(lons)>1 else 0.05
+    return dict(lon2d=lon2d,lat2d=lat2d,dep2d=dep2d,lons=lons,lats=lats,spacing=spacing)
 
-def download_zone(zone: str, data_dir: Path, force: bool = False) -> Path:
-    """
-    Download the Slab2 depth CSV for *zone* into *data_dir*.
-    Returns the local path.  Skips download if file already exists
-    (unless force=True).
-    """
-    data_dir = Path(data_dir)
-    data_dir.mkdir(parents=True, exist_ok=True)
-    dest = _local_cache(data_dir, zone)
-
-    if dest.exists() and not force:
-        return dest
-
-    url = f"{_GITHUB_BASE}/{zone}_slab2_dep_{_SLAB2_RELEASE_TAG}.csv"
-    print(f"  Downloading {zone} depth grid … ", end="", flush=True)
-    resp = requests.get(url, timeout=60)
-    resp.raise_for_status()
-    dest.write_bytes(resp.content)
-    size_kb = dest.stat().st_size / 1024
-    print(f"done ({size_kb:.0f} KB)")
-    return dest
-
-
-def download_all_zones(data_dir: str = "data/slab2", force: bool = False) -> dict:
-    """
-    Download depth grids for all 13 zones.
-    Returns {zone_code: local_path}.
-    """
-    data_dir = Path(data_dir)
-    paths = {}
-    print("Downloading Slab2 depth grids …")
+def load_all_zones(data_dir="data/slab2"):
+    d = Path(data_dir); grids = {}
     for zone in ZONES:
-        try:
-            paths[zone] = download_zone(zone, data_dir, force=force)
-        except requests.HTTPError as exc:
-            print(f"  WARNING: could not fetch {zone}: {exc}")
-    print(f"Done. {len(paths)}/{len(ZONES)} zones available.")
-    return paths
-
-
-def load_zone_grid(path: Path) -> dict:
-    """
-    Load a Slab2 depth CSV into a regular lon/lat grid.
-
-    Returns a dict with keys:
-        lon2d  : (ny, nx) float array, longitude (°E)
-        lat2d  : (ny, nx) float array, latitude (°N)
-        dep2d  : (ny, nx) float array, depth (km, positive down)
-        lons   : 1-D unique longitudes
-        lats   : 1-D unique latitudes
-        spacing: float, grid spacing (°)
-    """
-    # Slab2 CSV columns: lon, lat, dep  (dep is negative = km below surface)
-    data = np.genfromtxt(path, delimiter=",", skip_header=1,
-                         usecols=(0, 1, 2), filling_values=np.nan)
-    lon_flat, lat_flat, dep_flat = data[:, 0], data[:, 1], data[:, 2]
-
-    # Remove NaN rows
-    valid = np.isfinite(dep_flat)
-    lon_flat, lat_flat, dep_flat = lon_flat[valid], lat_flat[valid], dep_flat[valid]
-
-    # Convert depth to positive-down convention
-    dep_flat = np.abs(dep_flat)
-
-    lons = np.sort(np.unique(np.round(lon_flat, 4)))
-    lats = np.sort(np.unique(np.round(lat_flat, 4)))
-    spacing_lon = float(np.median(np.diff(lons))) if len(lons) > 1 else 0.05
-    spacing_lat = float(np.median(np.diff(lats))) if len(lats) > 1 else 0.05
-    spacing = round((spacing_lon + spacing_lat) / 2, 4)
-
-    nx, ny = len(lons), len(lats)
-    lon2d = np.full((ny, nx), np.nan)
-    lat2d = np.full((ny, nx), np.nan)
-    dep2d = np.full((ny, nx), np.nan)
-
-    # Map each point into the grid
-    lon_idx = np.searchsorted(lons, np.round(lon_flat, 4))
-    lat_idx = np.searchsorted(lats, np.round(lat_flat, 4))
-
-    # Guard against out-of-range indices from floating-point rounding
-    mask = (lon_idx < nx) & (lat_idx < ny)
-    lon2d[lat_idx[mask], lon_idx[mask]] = lon_flat[mask]
-    lat2d[lat_idx[mask], lon_idx[mask]] = lat_flat[mask]
-    dep2d[lat_idx[mask], lon_idx[mask]] = dep_flat[mask]
-
-    return dict(lon2d=lon2d, lat2d=lat2d, dep2d=dep2d,
-                lons=lons, lats=lats, spacing=spacing)
-
-
-def load_all_zones(data_dir: str = "data/slab2") -> dict:
-    """
-    Load all downloaded Slab2 grids.
-    Returns {zone_code: grid_dict}.
-    """
-    data_dir = Path(data_dir)
-    grids = {}
-    for zone in ZONES:
-        path = _local_cache(data_dir, zone)
-        if path.exists():
-            grids[zone] = load_zone_grid(path)
-        else:
-            print(f"  WARNING: {zone} not found — run download_all_zones() first.")
+        m = list(d.glob(f"{zone}_slab2_dep_*.grd"))
+        if not m: print(f"  WARNING: {zone} not found"); continue
+        grids[zone] = load_zone_grid(m[0])
     return grids
