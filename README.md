@@ -27,4 +27,4 @@ See uploaded source files in `src/`, `tests/`, and `requirements.txt`.
 
 Manish Paul  
 B.Tech Applied Geology (HPC micro-specialisation), IIT Kharagpur (batch 2028)  
-`24GG10024@iitk.ac.in`
+manishpaul.24@kgpian.iitkgp.ac.in
